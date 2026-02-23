@@ -1,0 +1,7 @@
+gmail_credentials.json
+gmail_token.pickle
+venv/
+__pycache__/
+error_logs/
+*.pyc
+.DS_Store
