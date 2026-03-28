@@ -4,6 +4,7 @@ Handles authentication and API operations.
 """
 
 import base64
+import os
 import pickle
 import re
 from email.mime.text import MIMEText
@@ -25,8 +26,8 @@ SCOPES = [
 
 # Paths relative to this module's parent directory
 BASE_DIR = Path(__file__).parent.parent
-CREDENTIALS_FILE = BASE_DIR / 'gmail_credentials.json'
-TOKEN_FILE = BASE_DIR / 'gmail_token.pickle'
+CREDENTIALS_FILE = Path(os.environ['GMAIL_CREDENTIALS_FILE']) if os.environ.get('GMAIL_CREDENTIALS_FILE') else BASE_DIR / 'gmail_credentials.json'
+TOKEN_FILE = Path(os.environ['GMAIL_TOKEN_FILE']) if os.environ.get('GMAIL_TOKEN_FILE') else BASE_DIR / 'gmail_token.pickle'
 
 
 def authenticate():
