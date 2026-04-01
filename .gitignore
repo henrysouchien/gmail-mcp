@@ -5,3 +5,6 @@ __pycache__/
 error_logs/
 *.pyc
 .DS_Store
+.excel_mcp_server.pid
+dist/
+*.pickle
