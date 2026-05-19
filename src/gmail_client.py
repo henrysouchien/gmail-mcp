@@ -280,6 +280,22 @@ def send_message(service, message: dict) -> dict:
     ).execute()
 
 
+def create_draft(service, message: dict) -> dict:
+    """Create a Gmail draft without sending it."""
+    return service.users().drafts().create(
+        userId='me',
+        body={'message': message}
+    ).execute()
+
+
+def send_draft(service, draft_id: str) -> dict:
+    """Send an existing Gmail draft by ID."""
+    return service.users().drafts().send(
+        userId='me',
+        body={'id': draft_id}
+    ).execute()
+
+
 def modify_labels(
     service,
     message_id: str,
@@ -303,6 +319,14 @@ def modify_labels(
 def trash_message(service, message_id: str) -> dict:
     """Move a message to trash."""
     return service.users().messages().trash(
+        userId='me',
+        id=message_id
+    ).execute()
+
+
+def untrash_message(service, message_id: str) -> dict:
+    """Restore a message from trash."""
+    return service.users().messages().untrash(
         userId='me',
         id=message_id
     ).execute()
