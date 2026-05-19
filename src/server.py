@@ -56,6 +56,34 @@ def _label_not_found(label_name: str) -> dict[str, Any]:
     ).to_envelope()
 
 
+def _bulk_result(action: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+    failed = sum(1 for item in results if item.get("status") == "error")
+    succeeded = len(results) - failed
+    return {
+        "status": "ok" if failed == 0 else "partial_error",
+        "action": action,
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "results": results,
+    }
+
+
+def _bulk_error(item: dict[str, Any], result: Any, *, error_class: str | None = None) -> dict[str, Any]:
+    message = result.get("message") if isinstance(result, dict) else str(result)
+    return {
+        "status": "error",
+        "item": item,
+        "error_class": error_class or (result.get("error_class") if isinstance(result, dict) else "ToolError"),
+        "message": message,
+        "error_payload": result,
+    }
+
+
+def _bulk_dict_item(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {"value": value}
+
+
 def _message_discovery_hint() -> list[dict[str, Any]]:
     return [
         {
@@ -624,6 +652,43 @@ def gmail_manage_labels(
         }
     except Exception as e:
         return _exception_envelope(e, suggested_tool_calls=_message_discovery_hint() + [{"name": "gmail_list_labels", "args": {}}])
+
+
+@mcp.tool()
+def gmail_manage_labels_bulk(items: list[dict[str, Any]]) -> dict:
+    """
+    Add or remove labels on multiple emails with per-message results.
+
+    Each item accepts message_id, add_labels, and remove_labels using the same label syntax as
+    gmail_manage_labels. Successful items include their own restore_token for gmail_restore_email.
+    """
+    results: list[dict[str, Any]] = []
+    for raw_item in items or []:
+        item = _bulk_dict_item(raw_item)
+        try:
+            result = gmail_manage_labels(
+                message_id=str(item.get("message_id") or ""),
+                add_labels=item.get("add_labels"),
+                remove_labels=item.get("remove_labels"),
+            )
+        except Exception as exc:
+            results.append(
+                _bulk_error(
+                    item,
+                    _exception_envelope(
+                        exc,
+                        suggested_tool_calls=_message_discovery_hint() + [{"name": "gmail_list_labels", "args": {}}],
+                    ),
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+
+        if isinstance(result, dict) and result.get("status") == "ok":
+            results.append({"status": "ok", "item": item, "result": result})
+        else:
+            results.append(_bulk_error(item, result))
+    return _bulk_result("gmail_manage_labels_bulk", results)
 
 
 @mcp.tool()

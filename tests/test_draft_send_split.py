@@ -238,3 +238,58 @@ def test_gmail_manage_labels_returns_restore_token_and_undo_swaps_labels(monkeyp
             "remove_labels": ["Label_1"],
         },
     )
+
+
+def test_gmail_manage_labels_bulk_reports_partial_failures(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+    service = object()
+
+    monkeypatch.setattr(server.gmail_client, "authenticate", lambda: service)
+    monkeypatch.setattr(
+        server.gmail_client,
+        "get_label_id",
+        lambda svc, label: {"Work": "Label_1", "STARRED": "STARRED"}.get(label),
+    )
+
+    def modify_labels(svc, message_id, add_labels=None, remove_labels=None):
+        calls.append(
+            (
+                "modify_labels",
+                {
+                    "service": svc,
+                    "message_id": message_id,
+                    "add_labels": add_labels,
+                    "remove_labels": remove_labels,
+                },
+            )
+        )
+        return {"labelIds": add_labels or []}
+
+    monkeypatch.setattr(server.gmail_client, "modify_labels", modify_labels)
+
+    result = server.gmail_manage_labels_bulk(
+        [
+            {"message_id": "msg-1", "add_labels": "Work", "remove_labels": "STARRED"},
+            {"message_id": "msg-2", "add_labels": "Missing"},
+        ]
+    )
+
+    assert result["status"] == "partial_error"
+    assert result["succeeded"] == 1
+    assert result["failed"] == 1
+    assert result["results"][0]["status"] == "ok"
+    assert result["results"][0]["result"]["undo_tool"] == "gmail_restore_email"
+    assert result["results"][0]["result"]["restore_token"]
+    assert result["results"][1]["status"] == "error"
+    assert result["results"][1]["error_class"] == "LabelNotFound"
+    assert calls == [
+        (
+            "modify_labels",
+            {
+                "service": service,
+                "message_id": "msg-1",
+                "add_labels": ["Label_1"],
+                "remove_labels": ["STARRED"],
+            },
+        )
+    ]
