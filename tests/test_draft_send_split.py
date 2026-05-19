@@ -3,7 +3,7 @@ from __future__ import annotations
 from src import server
 
 
-def test_gmail_send_email_defaults_to_draft(monkeypatch) -> None:
+def test_gmail_create_draft_composes_without_sending(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
     service = object()
 
@@ -24,40 +24,16 @@ def test_gmail_send_email_defaults_to_draft(monkeypatch) -> None:
         lambda svc, message: calls.append(("send_message", (svc, message))) or {"id": "msg-1", "threadId": "thread-1"},
     )
 
-    result = server.gmail_send_email("a@example.com", "Subject", "Body")
+    result = server.gmail_create_draft("a@example.com", "Subject", "Body")
 
-    assert "Draft ID: draft-1" in result
+    assert result["status"] == "draft_created"
+    assert result["draft_id"] == "draft-1"
+    assert result["confirm_token"].startswith("gmail:")
+    assert result["next_actions"][0]["tool"] == "gmail_send_draft"
     assert [name for name, _ in calls] == ["create_message", "create_draft"]
 
 
-def test_gmail_send_email_send_now_preserves_legacy_send(monkeypatch) -> None:
-    calls: list[tuple[str, object]] = []
-    service = object()
-
-    monkeypatch.setattr(server.gmail_client, "authenticate", lambda: service)
-    monkeypatch.setattr(
-        server.gmail_client,
-        "create_message",
-        lambda **kwargs: calls.append(("create_message", kwargs)) or {"raw": "encoded"},
-    )
-    monkeypatch.setattr(
-        server.gmail_client,
-        "create_draft",
-        lambda svc, message: calls.append(("create_draft", (svc, message))) or {"id": "draft-1"},
-    )
-    monkeypatch.setattr(
-        server.gmail_client,
-        "send_message",
-        lambda svc, message: calls.append(("send_message", (svc, message))) or {"id": "msg-1", "threadId": "thread-1"},
-    )
-
-    result = server.gmail_send_email("a@example.com", "Subject", "Body", send_now=True)
-
-    assert "Email sent successfully!" in result
-    assert [name for name, _ in calls] == ["create_message", "send_message"]
-
-
-def test_gmail_reply_email_defaults_to_reply_draft(monkeypatch) -> None:
+def test_gmail_create_reply_draft_composes_without_sending(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
     service = object()
     original = {
@@ -88,13 +64,31 @@ def test_gmail_reply_email_defaults_to_reply_draft(monkeypatch) -> None:
         lambda svc, message: calls.append(("send_message", (svc, message))) or {"id": "msg-1", "threadId": "thread-1"},
     )
 
-    result = server.gmail_reply_email("message-1", "Thanks")
+    result = server.gmail_create_reply_draft("message-1", "Thanks")
 
-    assert "Draft ID: draft-reply-1" in result
+    assert result["status"] == "draft_created"
+    assert result["draft_id"] == "draft-reply-1"
+    assert result["thread_id"] == "thread-1"
+    assert result["confirm_token"].startswith("gmail:")
+    assert result["next_actions"][0]["tool"] == "gmail_send_draft"
     assert [name for name, _ in calls] == ["create_message", "create_draft"]
 
 
-def test_gmail_send_draft_sends_existing_draft(monkeypatch) -> None:
+def test_gmail_send_draft_requires_confirm_token_before_sending(monkeypatch) -> None:
+    monkeypatch.setattr(server.gmail_client, "authenticate", lambda: (_ for _ in ()).throw(AssertionError("no send")))
+
+    result = server.gmail_send_draft("draft-1")
+
+    assert result["status"] == "confirmation_required"
+    assert result["draft_id"] == "draft-1"
+    assert result["confirm_token"].startswith("gmail:")
+    assert result["next_actions"][0]["arguments"] == {
+        "draft_id": "draft-1",
+        "confirm_token": result["confirm_token"],
+    }
+
+
+def test_gmail_send_draft_sends_existing_draft_with_confirm_token(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
     service = object()
 
@@ -105,7 +99,7 @@ def test_gmail_send_draft_sends_existing_draft(monkeypatch) -> None:
         lambda svc, draft_id: calls.append(("send_draft", (svc, draft_id))) or {"id": "msg-1", "threadId": "thread-1"},
     )
 
-    result = server.gmail_send_draft("draft-1")
+    result = server.gmail_send_draft("draft-1", confirm_token=server._draft_confirm_token("draft-1"))
 
     assert "Draft sent successfully!" in result
     assert calls == [("send_draft", (service, "draft-1"))]
@@ -121,7 +115,10 @@ def test_gmail_send_draft_error_uses_structured_envelope(monkeypatch) -> None:
         lambda svc, draft_id: (_ for _ in ()).throw(RuntimeError("draft not found")),
     )
 
-    result = server.gmail_send_draft("missing-draft")
+    result = server.gmail_send_draft(
+        "missing-draft",
+        confirm_token=server._draft_confirm_token("missing-draft"),
+    )
 
     assert result["status"] == "error"
     assert result["error_class"] == "RuntimeError"

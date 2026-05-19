@@ -4,6 +4,7 @@ Provides tools for reading, sending, and managing emails.
 """
 
 import base64
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -66,6 +67,27 @@ def _bulk_result(action: str, results: list[dict[str, Any]]) -> dict[str, Any]:
         "succeeded": succeeded,
         "failed": failed,
         "results": results,
+    }
+
+
+def _draft_confirm_token(draft_id: str) -> str:
+    digest = hashlib.sha256(f"gmail-send-draft:{draft_id}".encode("utf-8")).hexdigest()
+    return f"gmail:{digest[:16]}"
+
+
+def _draft_send_confirmation(draft_id: str) -> dict[str, Any]:
+    confirm_token = _draft_confirm_token(draft_id)
+    return {
+        "status": "confirmation_required",
+        "draft_id": draft_id,
+        "confirm_token": confirm_token,
+        "next_actions": [
+            {
+                "tool": "gmail_send_draft",
+                "arguments": {"draft_id": draft_id, "confirm_token": confirm_token},
+                "reason": "Send this draft after reviewing it.",
+            }
+        ],
     }
 
 
@@ -321,30 +343,38 @@ def gmail_create_draft(
             bcc=bcc
         )
         draft = gmail_client.create_draft(service, message)
-        return (
-            "Email draft created.\n"
-            f"Draft ID: {draft['id']}\n"
-            "Review the draft, then call gmail_send_draft(draft_id) to send."
-        )
+        confirmation = _draft_send_confirmation(draft["id"])
+        return {
+            "status": "draft_created",
+            "draft_id": draft["id"],
+            "message": "Email draft created. Review it, then call gmail_send_draft with confirm_token to send.",
+            "confirm_token": confirmation["confirm_token"],
+            "next_actions": confirmation["next_actions"],
+        }
     except Exception as e:
         return _exception_envelope(e, suggested_tool_calls=[{"name": "gmail_create_draft", "args": {"to": to, "subject": subject, "body": body}}])
 
 
 @mcp.tool()
-def gmail_send_draft(draft_id: str) -> str | dict:
+def gmail_send_draft(draft_id: str, confirm_token: str | None = None) -> str | dict:
     """
     Send an existing Gmail draft by draft ID.
 
-    Discovery: create or identify a draft first with `gmail_create_draft` or `gmail_create_reply_draft`.
+    Discovery: create or identify a draft first with `gmail_create_draft` or `gmail_create_reply_draft`;
+    those tools return the required `confirm_token`.
 
     Args:
         draft_id: Gmail draft ID to send
+        confirm_token: Confirmation token returned by `gmail_create_draft` or `gmail_create_reply_draft`
 
     Use this for: the final irreversible send step after draft review.
     NOT for: composing new message content -> see `gmail_create_draft`.
     NOT for: composing a reply draft -> see `gmail_create_reply_draft`.
     """
     try:
+        if confirm_token != _draft_confirm_token(draft_id):
+            return _draft_send_confirmation(draft_id)
+
         service = gmail_client.authenticate()
         result = gmail_client.send_draft(service, draft_id)
         return f"Draft sent successfully!\nMessage ID: {result['id']}\nThread ID: {result.get('threadId', '')}"
@@ -356,61 +386,6 @@ def gmail_send_draft(draft_id: str) -> str | dict:
                 {"name": "gmail_create_draft", "args": {"to": "recipient@example.com", "subject": "Subject", "body": "Body"}}
             ],
         )
-
-
-@mcp.tool()
-def gmail_send_email(
-    to: str,
-    subject: str,
-    body: str,
-    cc: Optional[str] = None,
-    bcc: Optional[str] = None,
-    send_now: bool = False,
-) -> str | dict:
-    """
-    Create a draft for a new email, or send immediately only when send_now=True.
-
-    Discovery: run `gmail_list_inbox` first to obtain `to` values.
-    Safety: default behavior creates a draft. Use `gmail_send_draft` after review for the irreversible send step.
-
-    Args:
-        to: Recipient email address(es), comma-separated for multiple
-        subject: Email subject line
-        body: Email body text (plain text)
-        cc: CC recipients, comma-separated (optional)
-        bcc: BCC recipients, comma-separated (optional)
-        send_now: If True, bypass draft review and send immediately. Default False.
-
-    Use this for: migration compatibility when callers still use gmail_send_email.
-    NOT for: the preferred two-step flow -> use `gmail_create_draft`, then `gmail_send_draft`.
-    NOT for: replying in an existing thread with a message ID → see `gmail_reply_email`.
-    NOT for: finding messages or message IDs before acting → see `gmail_search_emails`.
-    NOT for: reading existing email content without sending → see `gmail_read_email`.
-    """
-    try:
-        service = gmail_client.authenticate()
-
-        message = gmail_client.create_message(
-            to=to,
-            subject=subject,
-            body=body,
-            cc=cc,
-            bcc=bcc
-        )
-
-        if not send_now:
-            draft = gmail_client.create_draft(service, message)
-            return (
-                "Email draft created by gmail_send_email compatibility path.\n"
-                f"Draft ID: {draft['id']}\n"
-                "Review the draft, then call gmail_send_draft(draft_id) to send."
-            )
-
-        result = gmail_client.send_message(service, message)
-
-        return f"Email sent successfully!\nMessage ID: {result['id']}\nThread ID: {result['threadId']}"
-    except Exception as e:
-        return _exception_envelope(e, suggested_tool_calls=[{"name": "gmail_create_draft", "args": {"to": to, "subject": subject, "body": body}}])
 
 
 @mcp.tool()
@@ -475,93 +450,16 @@ def gmail_create_reply_draft(
         )
 
         draft = gmail_client.create_draft(service, message)
+        confirmation = _draft_send_confirmation(draft["id"])
 
-        return (
-            "Reply draft created.\n"
-            f"Draft ID: {draft['id']}\n"
-            f"Thread ID: {original['threadId']}\n"
-            "Review the draft, then call gmail_send_draft(draft_id) to send."
-        )
-    except Exception as e:
-        return _exception_envelope(e, suggested_tool_calls=_message_discovery_hint())
-
-
-@mcp.tool()
-def gmail_reply_email(
-    message_id: str,
-    body: str,
-    reply_all: bool = False,
-    send_now: bool = False,
-) -> str | dict:
-    """
-    Create a reply draft, or send the reply immediately only when send_now=True.
-
-    Discovery: run `gmail_list_inbox` first to obtain `message_id` values.
-    Safety: default behavior creates a draft. Use `gmail_send_draft` after review for the irreversible send step.
-
-    Args:
-        message_id: The ID of the message to reply to
-        body: Reply body text (plain text)
-        reply_all: If True, reply to all recipients (default: False, reply only to sender)
-        send_now: If True, bypass draft review and send immediately. Default False.
-
-    Use this for: migration compatibility when callers still use gmail_reply_email.
-    NOT for: the preferred two-step flow -> use `gmail_create_reply_draft`, then `gmail_send_draft`.
-    NOT for: composing a new standalone email with explicit recipients and subject → see `gmail_send_email`.
-    NOT for: finding candidate messages or message IDs → see `gmail_search_emails`.
-    NOT for: reading message content without replying → see `gmail_read_email`.
-    """
-    try:
-        service = gmail_client.authenticate()
-
-        # Get the original message
-        original = gmail_client.get_message(service, message_id)
-
-        # Build reply recipients.
-        reply_to = original['from']
-        reply_cc = None
-        if reply_all:
-            to_recipients = [original['from']]
-            if original['to']:
-                to_recipients.append(original['to'])
-            reply_to = ', '.join(filter(None, to_recipients))
-            reply_cc = original['cc'] or None
-
-        # Build subject with Re: prefix if not already present
-        subject = original['subject']
-        if not subject.lower().startswith('re:'):
-            subject = f"Re: {subject}"
-
-        # Build References header (chain of Message-IDs)
-        references = original.get('references', '')
-        if original.get('message_id'):
-            if references:
-                references = f"{references} {original['message_id']}"
-            else:
-                references = original['message_id']
-
-        message = gmail_client.create_message(
-            to=reply_to,
-            subject=subject,
-            body=body,
-            cc=reply_cc,
-            thread_id=original['threadId'],
-            in_reply_to=original.get('message_id'),
-            references=references
-        )
-
-        if not send_now:
-            draft = gmail_client.create_draft(service, message)
-            return (
-                "Reply draft created by gmail_reply_email compatibility path.\n"
-                f"Draft ID: {draft['id']}\n"
-                f"Thread ID: {original['threadId']}\n"
-                "Review the draft, then call gmail_send_draft(draft_id) to send."
-            )
-
-        result = gmail_client.send_message(service, message)
-
-        return f"Reply sent successfully!\nMessage ID: {result['id']}\nThread ID: {result['threadId']}"
+        return {
+            "status": "draft_created",
+            "draft_id": draft["id"],
+            "thread_id": original["threadId"],
+            "message": "Reply draft created. Review it, then call gmail_send_draft with confirm_token to send.",
+            "confirm_token": confirmation["confirm_token"],
+            "next_actions": confirmation["next_actions"],
+        }
     except Exception as e:
         return _exception_envelope(e, suggested_tool_calls=_message_discovery_hint())
 

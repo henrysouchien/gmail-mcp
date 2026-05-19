@@ -5,22 +5,22 @@ from pathlib import Path
 
 
 TARGETS = {
-    "gmail_send_email": {
+    "gmail_create_draft": {
         "discovery": "gmail_list_inbox",
         "siblings": (
-            "gmail_reply_email",
+            "gmail_create_reply_draft",
+            "gmail_send_draft",
             "gmail_search_emails",
             "gmail_read_email",
-            "gmail_delete_email",
         ),
     },
-    "gmail_reply_email": {
+    "gmail_create_reply_draft": {
         "discovery": "gmail_list_inbox",
         "siblings": (
-            "gmail_send_email",
+            "gmail_create_draft",
+            "gmail_send_draft",
             "gmail_search_emails",
             "gmail_read_email",
-            "gmail_delete_email",
         ),
     },
 }

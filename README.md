@@ -10,9 +10,11 @@ MCP server for Gmail operations.
 | `gmail_list_inbox` | List messages from a label (optionally unread only) |
 | `gmail_search_emails` | Search emails with Gmail query syntax |
 | `gmail_read_email` | Read a full email by message ID |
-| `gmail_send_email` | Send a new email |
-| `gmail_reply_email` | Reply to a message/thread (supports reply-all) |
+| `gmail_create_draft` | Compose a new email draft |
+| `gmail_create_reply_draft` | Compose a reply draft for a message/thread |
+| `gmail_send_draft` | Send an existing draft after review with its confirmation token |
 | `gmail_manage_labels` | Add or remove labels on a message |
+| `gmail_manage_labels_bulk` | Add or remove labels on multiple messages |
 | `gmail_delete_email` | Move message to trash or permanently delete |
 
 ## Setup
