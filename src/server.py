@@ -194,12 +194,19 @@ def gmail_send_email(
     """
     Compose and send a new email.
 
+    Discovery: run `gmail_list_inbox` first to obtain `to` values.
+
     Args:
         to: Recipient email address(es), comma-separated for multiple
         subject: Email subject line
         body: Email body text (plain text)
         cc: CC recipients, comma-separated (optional)
         bcc: BCC recipients, comma-separated (optional)
+
+    Use this for: starting a new email conversation with explicit recipients, subject, and body.
+    NOT for: replying in an existing thread with a message ID → see `gmail_reply_email`.
+    NOT for: finding messages or message IDs before acting → see `gmail_search_emails`.
+    NOT for: reading existing email content without sending → see `gmail_read_email`.
     """
     try:
         service = gmail_client.authenticate()
@@ -228,10 +235,17 @@ def gmail_reply_email(
     """
     Reply to an existing email thread.
 
+    Discovery: run `gmail_list_inbox` first to obtain `message_id` values.
+
     Args:
         message_id: The ID of the message to reply to
         body: Reply body text (plain text)
         reply_all: If True, reply to all recipients (default: False, reply only to sender)
+
+    Use this for: sending a reply within an existing Gmail thread using a message ID.
+    NOT for: composing a new standalone email with explicit recipients and subject → see `gmail_send_email`.
+    NOT for: finding candidate messages or message IDs → see `gmail_search_emails`.
+    NOT for: reading message content without replying → see `gmail_read_email`.
     """
     try:
         service = gmail_client.authenticate()
