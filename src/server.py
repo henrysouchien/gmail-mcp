@@ -141,6 +141,9 @@ def gmail_list_labels() -> str | dict:
     """
     List all Gmail labels (folders) in the mailbox.
     Returns both system labels (INBOX, SENT, etc.) and user-created labels.
+
+    Sibling tools: use gmail_list_inbox to list messages from a discovered
+    label, and gmail_manage_labels/gmail_manage_labels_bulk to change labels.
     """
     try:
         service = gmail_client.authenticate()
@@ -189,6 +192,12 @@ def gmail_list_inbox(
         max_results: Maximum number of messages to return (default: 20)
         label: Label/folder to list from (default: INBOX). Examples: "INBOX", "SENT", "STARRED", or custom labels
         unread_only: If True, only show unread messages
+
+    Discovery: use gmail_list_labels to find valid label names before passing
+    a custom label.
+
+    Sibling tools: use gmail_read_email with a returned message_id to inspect a
+    message, or gmail_search_email when label browsing is too broad.
     """
     try:
         service = gmail_client.authenticate()
@@ -284,6 +293,9 @@ def gmail_read_email(message_id: str) -> str | dict:
 
     Args:
         message_id: The ID of the message to read (from list or search results)
+
+    Discovery: use gmail_list_inbox or gmail_search_email first and pass the
+    returned message_id.
     """
     try:
         service = gmail_client.authenticate()
@@ -485,6 +497,11 @@ def gmail_manage_labels(
         - INBOX: In inbox (remove to archive)
         - TRASH: In trash
         - SPAM: In spam
+
+    Discovery: use gmail_list_inbox or gmail_search_email first to find the
+    message_id, and gmail_list_labels to verify custom label names.
+
+    Sibling tools: use gmail_manage_labels_bulk for multiple messages.
     """
     try:
         service = gmail_client.authenticate()
@@ -597,6 +614,9 @@ def gmail_delete_email(message_id: str, permanent: bool = False) -> str | dict:
     Args:
         message_id: The ID of the message to delete
         permanent: If True, permanently delete (cannot be undone). If False, move to trash (default)
+
+    Discovery: use gmail_list_inbox, gmail_search_email, or gmail_read_email
+    first to verify the message_id before deleting.
     """
     try:
         service = gmail_client.authenticate()
