@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
@@ -22,12 +23,29 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',       # Send emails
     'https://www.googleapis.com/auth/gmail.modify',     # Modify labels, trash
     'https://www.googleapis.com/auth/gmail.labels',     # Manage labels
+    'https://www.googleapis.com/auth/gmail.settings.basic',  # Manage filters
 ]
 
-# Paths relative to this module's parent directory
-BASE_DIR = Path(__file__).parent.parent
-CREDENTIALS_FILE = Path(os.environ['GMAIL_CREDENTIALS_FILE']) if os.environ.get('GMAIL_CREDENTIALS_FILE') else BASE_DIR / 'gmail_credentials.json'
-TOKEN_FILE = Path(os.environ['GMAIL_TOKEN_FILE']) if os.environ.get('GMAIL_TOKEN_FILE') else BASE_DIR / 'gmail_token.pickle'
+SETTINGS_SCOPE = 'https://www.googleapis.com/auth/gmail.settings.basic'
+_SYSTEM_LABELS = [
+    'INBOX', 'SENT', 'DRAFT', 'TRASH', 'SPAM', 'STARRED',
+    'IMPORTANT', 'UNREAD', 'CATEGORY_PERSONAL',
+    'CATEGORY_SOCIAL', 'CATEGORY_PROMOTIONS',
+    'CATEGORY_UPDATES', 'CATEGORY_FORUMS',
+]
+_LABEL_VISIBILITY = {'labelShow', 'labelShowIfUnread', 'labelHide'}
+_MESSAGE_VISIBILITY = {'show', 'hide'}
+
+# OAuth material belongs in user configuration, never in a source checkout.
+CONFIG_DIR = Path(
+    os.environ.get('GMAIL_CONFIG_DIR', Path.home() / '.config' / 'gmail-mcp')
+).expanduser()
+CREDENTIALS_FILE = Path(
+    os.environ.get('GMAIL_CREDENTIALS_FILE', CONFIG_DIR / 'gmail_credentials.json')
+).expanduser()
+TOKEN_FILE = Path(
+    os.environ.get('GMAIL_TOKEN_FILE', CONFIG_DIR / 'gmail_token.pickle')
+).expanduser()
 
 
 def authenticate():
@@ -46,14 +64,16 @@ def authenticate():
                 raise FileNotFoundError(
                     f"Credentials file not found at {CREDENTIALS_FILE}. "
                     "Please download OAuth credentials from Google Cloud Console "
-                    "and save as gmail_credentials.json in the gmail-mcp folder."
+                    f"and save them at {CONFIG_DIR / 'gmail_credentials.json'}."
                 )
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(CREDENTIALS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
 
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(TOKEN_FILE, 'wb') as token:
             pickle.dump(creds, token)
+        TOKEN_FILE.chmod(0o600)
 
     return build('gmail', 'v1', credentials=creds)
 
@@ -67,12 +87,7 @@ def get_labels(service) -> list[dict]:
 def get_label_id(service, label_name: str) -> Optional[str]:
     """Get label ID from label name. Handles both system and user labels."""
     # System labels have name == id (e.g., INBOX, SENT, TRASH)
-    system_labels = ['INBOX', 'SENT', 'DRAFT', 'TRASH', 'SPAM', 'STARRED',
-                     'IMPORTANT', 'UNREAD', 'CATEGORY_PERSONAL',
-                     'CATEGORY_SOCIAL', 'CATEGORY_PROMOTIONS',
-                     'CATEGORY_UPDATES', 'CATEGORY_FORUMS']
-
-    if label_name.upper() in system_labels:
+    if label_name.upper() in _SYSTEM_LABELS:
         return label_name.upper()
 
     # For user labels, look up by name
@@ -82,6 +97,117 @@ def get_label_id(service, label_name: str) -> Optional[str]:
             return label['id']
 
     return None
+
+
+def create_label(
+    service,
+    name: str,
+    message_list_visibility: str = 'show',
+    label_list_visibility: str = 'labelShow',
+) -> dict:
+    """Create a Gmail user label with the requested visibility settings."""
+    body = {
+        'name': name,
+        'messageListVisibility': message_list_visibility,
+        'labelListVisibility': label_list_visibility,
+    }
+    return service.users().labels().create(userId='me', body=body).execute()
+
+
+def find_label(service, name: str) -> Optional[dict]:
+    """Return a case-insensitive matching label resource, or None.
+
+    System labels return a synthetic resource with id, name, and system type.
+    """
+    upper_name = name.upper()
+    if upper_name in _SYSTEM_LABELS:
+        return {'id': upper_name, 'name': upper_name, 'type': 'system'}
+
+    for label in get_labels(service):
+        if label['name'].lower() == name.lower():
+            return label
+    return None
+
+
+def resolve_or_create_label(
+    service,
+    name: str,
+    message_list_visibility: str = 'show',
+    label_list_visibility: str = 'labelShow',
+) -> dict:
+    """Resolve or create a label and return its stored name and creation status.
+
+    Visibility is forwarded only when creating. A concurrent-create 409 falls
+    back to lookup so nested names and parallel actors remain idempotent.
+    """
+    existing = find_label(service, name)
+    if existing:
+        return {'id': existing['id'], 'name': existing['name'], 'created': False}
+
+    try:
+        made = create_label(
+            service,
+            name,
+            message_list_visibility,
+            label_list_visibility,
+        )
+    except HttpError as exc:
+        if getattr(exc, 'resp', None) is not None and exc.resp.status == 409:
+            existing = find_label(service, name)
+            if existing:
+                return {
+                    'id': existing['id'],
+                    'name': existing['name'],
+                    'created': False,
+                }
+        raise
+
+    return {'id': made['id'], 'name': made['name'], 'created': True}
+
+
+def token_scopes() -> list[str]:
+    """Return scopes on the effective cached token, or [] when unavailable.
+
+    Call this after authenticate so it reflects the current token pickle.
+    """
+    if not TOKEN_FILE.exists():
+        return []
+    try:
+        with open(TOKEN_FILE, 'rb') as token:
+            creds = pickle.load(token)
+    except Exception:
+        return []
+    return list(getattr(creds, 'scopes', None) or [])
+
+
+def create_filter(service, criteria: dict, action: dict) -> dict:
+    """Create a Gmail filter from raw Gmail criteria and action dictionaries."""
+    return service.users().settings().filters().create(
+        userId='me',
+        body={'criteria': criteria, 'action': action},
+    ).execute()
+
+
+def list_filters(service) -> list[dict]:
+    """List all Gmail filters for the authenticated user."""
+    result = service.users().settings().filters().list(userId='me').execute()
+    return result.get('filter', [])
+
+
+def get_filter(service, filter_id: str) -> dict:
+    """Fetch one Gmail filter by its API resource ID."""
+    return service.users().settings().filters().get(
+        userId='me',
+        id=filter_id,
+    ).execute()
+
+
+def delete_filter(service, filter_id: str) -> None:
+    """Delete one Gmail filter by its API resource ID."""
+    service.users().settings().filters().delete(
+        userId='me',
+        id=filter_id,
+    ).execute()
 
 
 def list_messages(
@@ -374,6 +500,6 @@ if __name__ == "__main__":
 
     # List recent messages
     messages = list_messages(service, max_results=3)
-    print(f"\nRecent messages:")
+    print("\nRecent messages:")
     for msg in messages:
         print(f"  - {msg['subject'][:50]}...")

@@ -57,6 +57,44 @@ def _label_not_found(label_name: str) -> dict[str, Any]:
     ).to_envelope()
 
 
+_SETTINGS_SCOPE = gmail_client.SETTINGS_SCOPE
+
+
+def _reauth_required_envelope() -> dict[str, Any]:
+    return ToolError(
+        error_class="ReauthRequired",
+        message=(
+            f"Filter management requires the {_SETTINGS_SCOPE} OAuth scope, which the current "
+            f"token lacks. Re-authenticate: back up and remove {gmail_client.TOKEN_FILE}, then "
+            "re-run the OAuth flow (account hc@henrychien.com) to mint a token with all scopes."
+        ),
+        suggested_tool_calls=[],
+    ).to_envelope()
+
+
+def _settings_scope_ok() -> bool:
+    return _SETTINGS_SCOPE in gmail_client.token_scopes()
+
+
+def _filter_exception_envelope(exc: Exception) -> dict[str, Any]:
+    content = getattr(exc, "content", None)
+    text = ""
+    if content:
+        text = (
+            content.decode("utf-8", "replace")
+            if isinstance(content, bytes)
+            else str(content)
+        )
+    text = (text + " " + str(exc)).lower()
+    if (
+        ("insufficient" in text and "scope" in text)
+        or "access_token_scope_insufficient" in text
+        or "insufficientpermissions" in text
+    ):
+        return _reauth_required_envelope()
+    return _exception_envelope(exc)
+
+
 def _bulk_result(action: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     failed = sum(1 for item in results if item.get("status") == "error")
     succeeded = len(results) - failed
@@ -617,6 +655,8 @@ def gmail_delete_email(message_id: str, permanent: bool = False) -> str | dict:
 
     Discovery: use gmail_list_inbox, gmail_search_email, or gmail_read_email
     first to verify the message_id before deleting.
+
+    Sibling tool: gmail_delete_filter deletes a filter definition, not a message.
     """
     try:
         service = gmail_client.authenticate()
@@ -694,6 +734,385 @@ def gmail_restore_email(restore_token: str) -> dict:
         raise ValueError("restore_token operation is not supported by gmail_restore_email")
     except Exception as e:
         return _exception_envelope(e, suggested_tool_calls=_message_discovery_hint())
+
+
+@mcp.tool()
+def gmail_create_label(
+    name: str,
+    message_list_visibility: str = "show",
+    label_list_visibility: str = "labelShow",
+) -> dict:
+    """
+    Idempotently create a Gmail label, including nested names such as Parent/Child.
+
+    Visibility is applied only when a new label is created. Allowed
+    message_list_visibility values are show and hide; allowed
+    label_list_visibility values are labelShow, labelShowIfUnread, and labelHide.
+
+    Discovery: use gmail_list_labels to inspect names before supplying required name.
+
+    Sibling tools: use gmail_create_filter to apply the label automatically, or
+    gmail_list_labels to inspect existing labels.
+    """
+    stripped_name = name.strip()
+    if not stripped_name:
+        return ToolError(
+            error_class="InvalidLabelName",
+            message="Label name must contain at least one non-whitespace character.",
+            names_correction={"name": "Provide a non-empty Gmail label name."},
+            suggested_tool_calls=[{"name": "gmail_list_labels", "args": {}}],
+        ).to_envelope()
+    if message_list_visibility not in gmail_client._MESSAGE_VISIBILITY:
+        return ToolError(
+            error_class="InvalidVisibility",
+            message=(
+                "message_list_visibility must be one of: "
+                + ", ".join(sorted(gmail_client._MESSAGE_VISIBILITY))
+            ),
+            names_correction={
+                "message_list_visibility": "Use show or hide.",
+            },
+            suggested_tool_calls=[],
+        ).to_envelope()
+    if label_list_visibility not in gmail_client._LABEL_VISIBILITY:
+        return ToolError(
+            error_class="InvalidVisibility",
+            message=(
+                "label_list_visibility must be one of: "
+                + ", ".join(sorted(gmail_client._LABEL_VISIBILITY))
+            ),
+            names_correction={
+                "label_list_visibility": (
+                    "Use labelShow, labelShowIfUnread, or labelHide."
+                ),
+            },
+            suggested_tool_calls=[],
+        ).to_envelope()
+
+    try:
+        service = gmail_client.authenticate()
+        result = gmail_client.resolve_or_create_label(
+            service,
+            stripped_name,
+            message_list_visibility,
+            label_list_visibility,
+        )
+        if result["created"]:
+            message = f"Label {result['name']} created."
+        else:
+            message = (
+                f"Label {result['name']} already existed; requested visibility "
+                "was not applied to the pre-existing label."
+            )
+        return {
+            "status": "ok",
+            "label_id": result["id"],
+            "name": result["name"],
+            "created": result["created"],
+            "visibility_applied": result["created"],
+            "message": message,
+        }
+    except Exception as e:
+        return _exception_envelope(
+            e,
+            suggested_tool_calls=[{"name": "gmail_list_labels", "args": {}}],
+        )
+
+
+@mcp.tool()
+def gmail_create_filter(
+    from_address: Optional[str] = None,
+    to_address: Optional[str] = None,
+    subject: Optional[str] = None,
+    query: Optional[str] = None,
+    negated_query: Optional[str] = None,
+    has_attachment: bool = False,
+    exclude_chats: bool = False,
+    add_labels: Optional[str] = None,
+    remove_labels: Optional[str] = None,
+    skip_inbox: bool = False,
+    mark_read: bool = False,
+    never_spam: bool = False,
+    mark_important: bool = False,
+    star: bool = False,
+) -> dict:
+    """
+    Create an idempotent Gmail filter from criteria and label actions.
+
+    Label names in add_labels and remove_labels are comma-separated. Missing
+    add labels are created after validation; remove labels must already exist.
+
+    Sibling tools: use gmail_create_label to configure label visibility first,
+    gmail_list_filters to inspect definitions, and gmail_delete_filter to remove one.
+    """
+    try:
+        service = gmail_client.authenticate()
+        if not _settings_scope_ok():
+            return _reauth_required_envelope()
+
+        criteria: dict[str, Any] = {}
+        for key, value in (
+            ("from", from_address),
+            ("to", to_address),
+            ("subject", subject),
+            ("query", query),
+            ("negatedQuery", negated_query),
+        ):
+            if value:
+                criteria[key] = value
+        if has_attachment:
+            criteria["hasAttachment"] = True
+        if exclude_chats:
+            criteria["excludeChats"] = True
+
+        remove_names = [
+            token.strip()
+            for token in (remove_labels or "").split(",")
+            if token.strip()
+        ]
+        if skip_inbox:
+            remove_names.append("INBOX")
+        if mark_read:
+            remove_names.append("UNREAD")
+        if never_spam:
+            remove_names.append("SPAM")
+
+        remove_ids: list[str] = []
+        remove_id_names: dict[str, str] = {}
+        for label_name in remove_names:
+            label_id = gmail_client.get_label_id(service, label_name)
+            if not label_id:
+                return _label_not_found(label_name)
+            remove_ids.append(label_id)
+            remove_id_names.setdefault(label_id, label_name)
+
+        add_names = [
+            token.strip()
+            for token in (add_labels or "").split(",")
+            if token.strip()
+        ]
+        if mark_important:
+            add_names.append("IMPORTANT")
+        if star:
+            add_names.append("STARRED")
+
+        add_ids: list[str] = []
+        add_id_names: dict[str, str] = {}
+        missing_add_names: list[str] = []
+        for label_name in add_names:
+            label_id = gmail_client.get_label_id(service, label_name)
+            if label_id:
+                add_ids.append(label_id)
+                add_id_names.setdefault(label_id, label_name)
+            else:
+                missing_add_names.append(label_name)
+
+        if not criteria or (not add_names and not remove_names):
+            return ToolError(
+                error_class="EmptyFilter",
+                message="A filter requires at least one criterion and one action.",
+                names_correction={
+                    "criteria": "Provide a sender, recipient, subject, query, or criteria flag.",
+                    "action": "Provide a label action or convenience action flag.",
+                },
+                suggested_tool_calls=[{"name": "gmail_list_filters", "args": {}}],
+            ).to_envelope()
+
+        conflict_ids = set(add_ids).intersection(remove_ids)
+        if conflict_ids:
+            conflict_id = next(
+                label_id for label_id in add_ids if label_id in conflict_ids
+            )
+            offender = add_id_names.get(
+                conflict_id,
+                remove_id_names.get(conflict_id, conflict_id),
+            )
+            return ToolError(
+                error_class="ConflictingLabels",
+                message=(
+                    f"Label {offender} resolves to {conflict_id} and cannot be "
+                    "both added and removed by the same filter."
+                ),
+                names_correction={
+                    "add_labels": "Remove the label from either add_labels or remove_labels.",
+                },
+                suggested_tool_calls=[{"name": "gmail_list_labels", "args": {}}],
+            ).to_envelope()
+
+        resolved_labels: list[dict[str, Any]] = []
+        for label_name in missing_add_names:
+            resolved = gmail_client.resolve_or_create_label(service, label_name)
+            add_ids.append(resolved["id"])
+            resolved_labels.append(
+                {
+                    "name": resolved["name"],
+                    "id": resolved["id"],
+                    "created": resolved["created"],
+                }
+            )
+
+        add_ids = list(dict.fromkeys(add_ids))
+        remove_ids = list(dict.fromkeys(remove_ids))
+        action: dict[str, list[str]] = {}
+        if add_ids:
+            action["addLabelIds"] = add_ids
+        if remove_ids:
+            action["removeLabelIds"] = remove_ids
+
+        def canonical(candidate: dict[str, Any]) -> tuple[dict, dict]:
+            candidate_action = candidate.get("action", {})
+            return (
+                candidate.get("criteria", {}),
+                {
+                    key: sorted(candidate_action[key])
+                    for key in ("addLabelIds", "removeLabelIds")
+                    if candidate_action.get(key)
+                },
+            )
+
+        wanted = canonical({"criteria": criteria, "action": action})
+        for existing in gmail_client.list_filters(service):
+            if canonical(existing) == wanted:
+                return {
+                    "status": "ok",
+                    "filter_id": existing["id"],
+                    "created": False,
+                    "criteria": criteria,
+                    "action": action,
+                    "resolved_labels": resolved_labels,
+                    "message": f"Equivalent filter {existing['id']} already exists.",
+                }
+
+        made = gmail_client.create_filter(service, criteria, action)
+        return {
+            "status": "ok",
+            "filter_id": made["id"],
+            "created": True,
+            "criteria": criteria,
+            "action": action,
+            "resolved_labels": resolved_labels,
+            "message": f"Filter {made['id']} created.",
+        }
+    except Exception as e:
+        return _filter_exception_envelope(e)
+
+
+@mcp.tool()
+def gmail_list_filters() -> dict:
+    """
+    List Gmail filters and annotate their action label IDs with label names.
+
+    Sibling tools: use gmail_create_filter to add a definition and
+    gmail_delete_filter to preview or delete a discovered filter. Use
+    gmail_list_labels for label names and gmail_list_inbox for matching messages.
+    """
+    try:
+        service = gmail_client.authenticate()
+        if not _settings_scope_ok():
+            return _reauth_required_envelope()
+
+        raw_filters = gmail_client.list_filters(service)
+        labels = gmail_client.get_labels(service)
+        label_names = {label["id"]: label["name"] for label in labels}
+        filters = []
+        for item in raw_filters:
+            action = item.get("action", {})
+            filters.append(
+                {
+                    "id": item["id"],
+                    "criteria": item.get("criteria", {}),
+                    "action": action,
+                    "action_label_names": {
+                        "addLabelIds": [
+                            label_names.get(label_id, label_id)
+                            for label_id in action.get("addLabelIds", [])
+                        ],
+                        "removeLabelIds": [
+                            label_names.get(label_id, label_id)
+                            for label_id in action.get("removeLabelIds", [])
+                        ],
+                    },
+                }
+            )
+        return {"status": "ok", "count": len(filters), "filters": filters}
+    except Exception as e:
+        return _filter_exception_envelope(e)
+
+
+@mcp.tool()
+def gmail_delete_filter(filter_id: str, dry_run: bool = False) -> dict:
+    """
+    Preview or delete a Gmail filter while preserving its raw restore recipe.
+
+    Discovery: use gmail_list_filters to find and verify the required filter_id.
+
+    The restore recipe must be mapped to gmail_create_filter arguments; raw keys
+    such as from and addLabelIds are not accepted directly. Sibling destructive
+    tool gmail_delete_email deletes messages, not filter definitions.
+    """
+    try:
+        service = gmail_client.authenticate()
+        if not _settings_scope_ok():
+            return _reauth_required_envelope()
+
+        try:
+            existing = gmail_client.get_filter(service, filter_id)
+        except Exception as e:
+            if (
+                getattr(getattr(e, "resp", None), "status", None) == 404
+            ):
+                return ToolError(
+                    error_class="FilterNotFound",
+                    message=f"Filter not found: {filter_id}",
+                    names_correction={
+                        "filter_id": "Run gmail_list_filters and use a returned filter ID.",
+                    },
+                    suggested_tool_calls=[{"name": "gmail_list_filters", "args": {}}],
+                ).to_envelope()
+            raise
+
+        restore_recipe = {
+            "criteria": existing.get("criteria", {}),
+            "action": existing.get("action", {}),
+        }
+        if dry_run:
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "filter": existing,
+                "would_delete": filter_id,
+                "restore_recipe": restore_recipe,
+            }
+
+        try:
+            gmail_client.delete_filter(service, filter_id)
+        except Exception as e:
+            if (
+                getattr(getattr(e, "resp", None), "status", None) == 404
+            ):
+                return ToolError(
+                    error_class="FilterNotFound",
+                    message=f"Filter not found: {filter_id}",
+                    names_correction={
+                        "filter_id": "Run gmail_list_filters and use a returned filter ID.",
+                    },
+                    suggested_tool_calls=[{"name": "gmail_list_filters", "args": {}}],
+                ).to_envelope()
+            raise
+
+        return {
+            "status": "ok",
+            "filter_id": filter_id,
+            "deleted_filter": existing,
+            "restore_recipe": restore_recipe,
+            "message": (
+                "Filter deleted. To recreate it, map raw Gmail restore_recipe "
+                "fields to gmail_create_filter arguments (for example, from to "
+                "from_address and label IDs to label names)."
+            ),
+        }
+    except Exception as e:
+        return _filter_exception_envelope(e)
 
 
 # Main entry point
