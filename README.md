@@ -34,13 +34,23 @@ pip install -e .
 ```
 
 ### Authentication
-1. Save OAuth credentials as `gmail_credentials.json` in the repository root.
+1. Save OAuth credentials outside the repository at
+   `~/.config/gmail-mcp/gmail_credentials.json` and restrict the file to your user:
+```bash
+mkdir -p ~/.config/gmail-mcp
+chmod 700 ~/.config/gmail-mcp
+chmod 600 ~/.config/gmail-mcp/gmail_credentials.json
+```
 2. Run initial authentication once:
 ```bash
 source venv/bin/activate
 python -c "from src import gmail_client; gmail_client.authenticate()"
 ```
-3. Complete browser consent. A local `gmail_token.pickle` cache will be created.
+3. Complete browser consent. The token cache is written to
+   `~/.config/gmail-mcp/gmail_token.pickle` with mode `0600`.
+
+Set `GMAIL_CONFIG_DIR` to relocate both defaults, or use
+`GMAIL_CREDENTIALS_FILE` and `GMAIL_TOKEN_FILE` for per-process overrides.
 
 ### Claude Code Configuration
 Add to `~/.claude.json`:
